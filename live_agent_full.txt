@@ -1,0 +1,1248 @@
+import asyncio
+import re
+from typing import Any
+
+from dotenv import load_dotenv
+
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    JobContext,
+    cli,
+)
+
+from livekit.plugins import google
+
+from kernel import Kernel, TaskStatus
+from interrupt_detector import InterruptDetector
+from flight_search import FlightSearchTool
+
+
+load_dotenv(".env.local")
+
+
+# ============================================================
+# ECHO FLOW AGENT
+# ============================================================
+
+class EchoFlowAgent(Agent):
+
+    def __init__(self):
+        super().__init__(
+            instructions=(
+                "You are Echo Flow, a helpful voice flight assistant. "
+                "Have a natural conversation with the user. "
+                "Help users search for flights when they clearly ask for a flight search. "
+                "Required flight information is origin, destination, and trip type. "
+                "Date is optional. "
+                "Do not repeatedly ask for information the user has already provided. "
+                "If the user is simply chatting, answer normally and do not start a flight search. "
+                "If the user gives a correction to an existing flight request, accept the correction."
+            )
+        )
+
+
+# ============================================================
+# ECHO FLOW CONTROLLER
+# ============================================================
+
+class EchoFlowController:
+
+    def __init__(self, session: AgentSession):
+
+        self.session = session
+
+        # ----------------------------------------------------
+        # Core kernel
+        # ----------------------------------------------------
+
+        self.kernel = Kernel()
+
+        # ----------------------------------------------------
+        # Interruption / slot detector
+        # ----------------------------------------------------
+
+        self.detector = InterruptDetector()
+
+        # ----------------------------------------------------
+        # Current flight context
+        # ----------------------------------------------------
+
+        self.flight_slots: dict[str, Any] = {}
+
+        # True after a flight search successfully completed.
+        #
+        # We keep flight_slots so the user can say:
+        #
+        # "Actually change the destination to Mumbai"
+        #
+        # without having to repeat the entire request.
+        self.flight_search_completed = False
+
+        # ----------------------------------------------------
+        # Previous user utterance
+        # ----------------------------------------------------
+
+        self.previous_user_text = ""
+
+        # ----------------------------------------------------
+        # Currently executing controller task
+        # ----------------------------------------------------
+
+        self.current_execution_task: asyncio.Task | None = None
+
+        # ----------------------------------------------------
+        # Serialize controller processing.
+        #
+        # This prevents two final transcripts from modifying
+        # flight state at the same time.
+        # ----------------------------------------------------
+
+        self.handle_lock = asyncio.Lock()
+
+        # ----------------------------------------------------
+        # Controller speech protection
+        # ----------------------------------------------------
+
+        self.controller_speaking = False
+
+        # ----------------------------------------------------
+        # Search protection
+        # ----------------------------------------------------
+
+        self.flight_search_running = False
+
+        # ----------------------------------------------------
+        # Duplicate response protection
+        # ----------------------------------------------------
+
+        self.last_response_text: str | None = None
+
+    # ========================================================
+    # SLOT MANAGEMENT
+    # ========================================================
+
+    def _get_missing_slots(self) -> list[str]:
+
+        required_slots = [
+            "origin",
+            "destination",
+            "trip_type",
+        ]
+
+        return [
+            slot
+            for slot in required_slots
+            if not self.flight_slots.get(slot)
+        ]
+
+    def _merge_slots(self, new_slots: dict[str, Any]):
+
+        if not new_slots:
+            return
+
+        print()
+        print("SLOTS TO MERGE:")
+        print(new_slots)
+
+        for key, value in new_slots.items():
+
+            if value is None:
+                continue
+
+            if isinstance(value, str) and not value.strip():
+                continue
+
+            # IMPORTANT:
+            #
+            # Never allow changed_slots metadata like:
+            #
+            # {
+            #     "old": "Delhi",
+            #     "new": "Mumbai"
+            # }
+            #
+            # to become a real slot value.
+            #
+            if isinstance(value, dict):
+
+                if "new" in value:
+                    value = value["new"]
+                else:
+                    print(
+                        f"Ignoring invalid dictionary slot for {key}: "
+                        f"{value}"
+                    )
+                    continue
+
+            self.flight_slots[key] = value
+
+        print()
+        print("UPDATED FLIGHT SLOTS:")
+        print(self.flight_slots)
+
+    # ========================================================
+    # CORRECTION SLOT EXTRACTION
+    # ========================================================
+
+    def _extract_correction_slots(
+        self,
+        text: str,
+        current_slots: dict[str, Any],
+        interruption: Any,
+    ) -> dict[str, Any]:
+
+        """
+        Convert an interruption into REAL slot values.
+
+        IMPORTANT:
+
+        interruption.changed_slots contains metadata such as:
+
+            {
+                "destination": {
+                    "old": "Delhi",
+                    "new": "Mumbai"
+                }
+            }
+
+        That metadata must NEVER be passed directly to the
+        flight tool.
+
+        This method extracts only:
+
+            destination = "Mumbai"
+
+        """
+
+        corrected_slots: dict[str, Any] = {}
+
+        lower = text.lower()
+
+        # ----------------------------------------------------
+        # Destination correction
+        # ----------------------------------------------------
+
+        if "destination" in lower:
+
+            if current_slots.get("destination"):
+                corrected_slots["destination"] = (
+                    current_slots["destination"]
+                )
+
+        # ----------------------------------------------------
+        # Origin correction
+        # ----------------------------------------------------
+
+        if "origin" in lower:
+
+            if current_slots.get("origin"):
+                corrected_slots["origin"] = (
+                    current_slots["origin"]
+                )
+
+        # ----------------------------------------------------
+        # Date correction
+        # ----------------------------------------------------
+
+        date_words = [
+            "date",
+            "on ",
+            "for ",
+            "tomorrow",
+            "today",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ]
+
+        if (
+            "date" in lower
+            or any(word in lower for word in date_words[2:])
+        ):
+
+            if current_slots.get("date"):
+                corrected_slots["date"] = current_slots["date"]
+
+        # ----------------------------------------------------
+        # Trip type correction
+        # ----------------------------------------------------
+
+        if (
+            "one way" in lower
+            or "one-way" in lower
+            or "oneway" in lower
+        ):
+
+            corrected_slots["trip_type"] = "one_way"
+
+        elif (
+            "round trip" in lower
+            or "round-trip" in lower
+            or "roundtrip" in lower
+        ):
+
+            corrected_slots["trip_type"] = "round_trip"
+
+        # ----------------------------------------------------
+        # Fallback:
+        #
+        # If detector gave changed_slots, only take the NEW
+        # values, never the old/new dictionary itself.
+        #
+        # But do this only for keys explicitly present in the
+        # user's correction text.
+        # ----------------------------------------------------
+
+        changed_slots = getattr(
+            interruption,
+            "changed_slots",
+            {},
+        )
+
+        for key, change in changed_slots.items():
+
+            if key in corrected_slots:
+                continue
+
+            if key not in (
+                "origin",
+                "destination",
+                "date",
+                "trip_type",
+            ):
+                continue
+
+            if key not in lower:
+                continue
+
+            if isinstance(change, dict):
+
+                new_value = change.get("new")
+
+                if new_value:
+                    corrected_slots[key] = new_value
+
+            elif change:
+
+                corrected_slots[key] = change
+
+        print()
+        print("CORRECTED REAL SLOTS:")
+        print(corrected_slots)
+
+        return corrected_slots
+
+    # ========================================================
+    # DEBUG / MISSING INFORMATION
+    # ========================================================
+
+    async def _ask_for_missing_information(self):
+
+        missing = self._get_missing_slots()
+
+        print()
+        print("MISSING FLIGHT INFORMATION:")
+        print(missing)
+
+        # Gemini Realtime handles normal conversation.
+        #
+        # DO NOT call generate_reply() here.
+        #
+        # Otherwise Gemini may produce one question and the
+        # controller may produce another question.
+        return
+
+    # ========================================================
+    # CONTROLLER SPEECH
+    # ========================================================
+
+    async def speak(self, text: str):
+
+        if not text:
+            return
+
+        if self.controller_speaking:
+            print("Controller is already speaking.")
+            return
+
+        if text == self.last_response_text:
+            print("Duplicate controller response ignored.")
+            return
+
+        self.controller_speaking = True
+        self.last_response_text = text
+
+        try:
+
+            print()
+            print("CONTROLLER SPEAKING:")
+            print(text)
+
+            await self.session.generate_reply(
+                instructions=(
+                    "Announce the following completed flight search "
+                    "result naturally and concisely. "
+                    "Do not ask another question. "
+                    "Do not change any facts.\n\n"
+                    f"{text}"
+                )
+            )
+
+        finally:
+
+            self.controller_speaking = False
+
+    # ========================================================
+    # CANCEL CURRENT EXECUTION
+    # ========================================================
+
+    async def _cancel_current_execution(
+        self,
+        invalidate_kernel_task: bool = True,
+    ):
+
+        execution_task = self.current_execution_task
+
+        if (
+            execution_task is not None
+            and not execution_task.done()
+        ):
+
+            print()
+            print("CANCELLING CURRENT FLIGHT EXECUTION")
+
+            execution_task.cancel()
+
+            try:
+                await execution_task
+            except asyncio.CancelledError:
+                pass
+
+        self.current_execution_task = None
+        self.flight_search_running = False
+
+        # ----------------------------------------------------
+        # Invalidate the kernel task.
+        #
+        # This prevents a stale result from being accepted.
+        # ----------------------------------------------------
+
+        if invalidate_kernel_task:
+
+            if self.kernel.current_task is not None:
+
+                self.kernel.current_task.status = (
+                    TaskStatus.CANCELLED
+                )
+
+                print(
+                    "Kernel task invalidated:",
+                    self.kernel.current_task_id,
+                )
+
+            self.kernel.current_task = None
+            self.kernel.current_task_id = None
+
+    # ========================================================
+    # FLIGHT SEARCH
+    # ========================================================
+
+    async def execute_flight_task(self):
+
+        if self.flight_search_running:
+
+            print("Flight search already running.")
+            return
+
+        if self.kernel.current_task is None:
+
+            print("No kernel task available.")
+            return
+
+        task_id = self.kernel.current_task_id
+
+        if task_id is None:
+
+            print("No current task ID.")
+            return
+
+        # Snapshot the task's arguments.
+        #
+        # This is important because flight_slots may change while
+        # a task is running.
+        task_slots = dict(self.flight_slots)
+
+        self.flight_search_running = True
+
+        try:
+
+            print()
+            print("===================================")
+            print("STARTING FLIGHT SEARCH")
+            print("===================================")
+
+            print("Task ID:", task_id)
+            print("Slots:", task_slots)
+
+            tool = FlightSearchTool()
+
+            max_attempts = self.kernel.max_retries + 1
+
+            for attempt in range(max_attempts):
+
+                # ------------------------------------------------
+                # STALE TASK CHECK BEFORE TOOL
+                # ------------------------------------------------
+
+                if self.kernel.current_task is None:
+
+                    print(
+                        "Task disappeared before search."
+                    )
+
+                    return
+
+                if self.kernel.current_task_id != task_id:
+
+                    print(
+                        "Ignoring execution for stale task:",
+                        task_id,
+                    )
+
+                    return
+
+                print()
+                print("-----------------------------------")
+                print(f"SEARCH ATTEMPT {attempt + 1}")
+                print("-----------------------------------")
+
+                result = await tool.run(
+                    task_id=task_id,
+                    **task_slots,
+                )
+
+                # ------------------------------------------------
+                # STALE TASK CHECK AFTER TOOL
+                #
+                # This is critical.
+                #
+                # If the user corrected the request while the
+                # tool was running, the old result must not be
+                # accepted.
+                # ------------------------------------------------
+
+                if self.kernel.current_task is None:
+
+                    print()
+                    print(
+                        "STALE RESULT IGNORED: "
+                        "current task no longer exists."
+                    )
+
+                    return
+
+                if self.kernel.current_task_id != task_id:
+
+                    print()
+                    print(
+                        "STALE RESULT IGNORED:",
+                        task_id,
+                    )
+
+                    return
+
+                # ------------------------------------------------
+                # SUCCESS
+                # ------------------------------------------------
+
+                if result.success:
+
+                    print()
+                    print("FLIGHT SEARCH SUCCESS")
+                    print(result.data)
+
+                    result_id = (
+                        f"flight-result-{task_id}-{attempt + 1}"
+                    )
+
+                    self.kernel.complete_task(
+                        task_id=task_id,
+                        result_id=result_id,
+                    )
+
+                    # ------------------------------------------------
+                    # Only mark completed if this is STILL the
+                    # active task.
+                    # ------------------------------------------------
+
+                    if (
+                        self.kernel.current_task is None
+                        or self.kernel.current_task_id != task_id
+                    ):
+
+                        print(
+                            "Completion became stale. "
+                            "Ignoring announcement."
+                        )
+
+                        return
+
+                    self.flight_search_completed = True
+
+                    message = (
+                        f"I found a flight from "
+                        f"{result.data.get('origin')} "
+                        f"to "
+                        f"{result.data.get('destination')}."
+                    )
+
+                    if result.data.get("date"):
+
+                        message += (
+                            f" The requested date is "
+                            f"{result.data.get('date')}."
+                        )
+
+                    if result.data.get("trip_type"):
+
+                        trip_type = result.data.get(
+                            "trip_type"
+                        )
+
+                        if trip_type == "one_way":
+
+                            message += (
+                                " It is a one-way trip."
+                            )
+
+                        elif trip_type == "round_trip":
+
+                            message += (
+                                " It is a round-trip."
+                            )
+
+                    await self.speak(message)
+
+                    return
+
+                # ------------------------------------------------
+                # FAILURE
+                # ------------------------------------------------
+
+                print()
+                print("FLIGHT SEARCH FAILED")
+                print("Error:", result.error)
+                print("Retryable:", result.retryable)
+
+                if not result.retryable:
+
+                    self.kernel.fail_task(task_id)
+
+                    await self.speak(
+                        "I couldn't complete the flight search "
+                        "because the request was invalid."
+                    )
+
+                    return
+
+                # ------------------------------------------------
+                # RETRY
+                # ------------------------------------------------
+
+                self.kernel.fail_task(task_id)
+
+                if attempt + 1 >= max_attempts:
+
+                    print(
+                        "Maximum retry attempts reached."
+                    )
+
+                    await self.speak(
+                        "The flight search service is still "
+                        "unavailable. Please try again."
+                    )
+
+                    return
+
+                self.kernel.retry_task(task_id)
+
+                await asyncio.sleep(0.2)
+
+        except asyncio.CancelledError:
+
+            print(
+                "Flight execution task cancelled."
+            )
+
+            raise
+
+        except Exception as exc:
+
+            print()
+            print("FLIGHT EXECUTION ERROR:")
+            print(type(exc).__name__, exc)
+
+            if (
+                self.kernel.current_task is not None
+                and self.kernel.current_task_id == task_id
+            ):
+
+                self.kernel.fail_task(task_id)
+
+                await self.speak(
+                    "Something went wrong while searching "
+                    "for the flight."
+                )
+
+        finally:
+
+            self.flight_search_running = False
+
+            current_task = asyncio.current_task()
+
+            if self.current_execution_task is current_task:
+
+                self.current_execution_task = None
+
+    # ========================================================
+    # START FLIGHT TASK
+    # ========================================================
+
+    async def start_flight_task(self):
+
+        if self.flight_search_running:
+
+            print(
+                "Flight search already running."
+            )
+
+            return
+
+        missing = self._get_missing_slots()
+
+        if missing:
+
+            print()
+            print("CANNOT START FLIGHT SEARCH")
+            print("Missing:", missing)
+
+            await self._ask_for_missing_information()
+
+            return
+
+        # ----------------------------------------------------
+        # Cancel any previous execution.
+        # ----------------------------------------------------
+
+        if (
+            self.current_execution_task is not None
+            and not self.current_execution_task.done()
+        ):
+
+            print(
+                "Cancelling previous execution task."
+            )
+
+            await self._cancel_current_execution(
+                invalidate_kernel_task=True
+            )
+
+        # ----------------------------------------------------
+        # A new task is starting.
+        # ----------------------------------------------------
+
+        self.flight_search_completed = False
+
+        # ----------------------------------------------------
+        # Build clean goal using REAL slot values.
+        # ----------------------------------------------------
+
+        goal = (
+            f"Find a flight from "
+            f"{self.flight_slots.get('origin')} "
+            f"to "
+            f"{self.flight_slots.get('destination')}"
+        )
+
+        task = self.kernel.start_task(goal)
+
+        print()
+        print("KERNEL TASK STARTED")
+        print("Task ID:", task.task_id)
+        print("Goal:", task.goal)
+
+        # ----------------------------------------------------
+        # Checkpoint
+        # ----------------------------------------------------
+
+        self.kernel.save_checkpoint(
+            task_id=task.task_id,
+            step=1,
+            data=dict(self.flight_slots),
+        )
+
+        # ----------------------------------------------------
+        # Start execution
+        # ----------------------------------------------------
+
+        self.current_execution_task = (
+            asyncio.create_task(
+                self.execute_flight_task()
+            )
+        )
+
+    # ========================================================
+    # HANDLE USER TEXT
+    # ========================================================
+
+    async def handle_user_text(self, text: str):
+
+        async with self.handle_lock:
+
+            await self._handle_user_text_locked(text)
+
+    # ========================================================
+    # INTERNAL USER TEXT HANDLER
+    # ========================================================
+
+    async def _handle_user_text_locked(
+        self,
+        text: str,
+    ):
+
+        if not text:
+            return
+
+        text = text.strip()
+
+        if not text:
+            return
+
+        print()
+        print("===================================")
+        print("USER TRANSCRIPT:")
+        print(text)
+        print("===================================")
+
+        # ----------------------------------------------------
+        # Current active slots
+        # ----------------------------------------------------
+
+        active_slots = dict(self.flight_slots)
+
+        # ----------------------------------------------------
+        # Detect interruption
+        # ----------------------------------------------------
+
+        interruption = (
+            self.detector.classify_interruption(
+                previous_text=self.previous_user_text,
+                current_text=text,
+                active_slots=active_slots,
+            )
+        )
+
+        print()
+        print("INTERRUPTION RESULT:")
+        print(interruption)
+
+        # ----------------------------------------------------
+        # Extract raw slots
+        # ----------------------------------------------------
+
+        current_slots = (
+            self.detector.extract_slots(text)
+        )
+
+        print()
+        print("CURRENT SLOTS:")
+        print(current_slots)
+
+        # ====================================================
+        # CORRECTION / INTERRUPTION
+        # ====================================================
+
+        if interruption.interrupted:
+
+            print()
+            print("INTERRUPTION DETECTED")
+            print(
+                "TYPE:",
+                interruption.interruption_type,
+            )
+            print(
+                "REASON:",
+                interruption.reason,
+            )
+            print(
+                "CHANGED:",
+                interruption.changed_slots,
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # Do NOT do:
+            #
+            # self._merge_slots(
+            #     interruption.changed_slots
+            # )
+            #
+            # because changed_slots contains old/new metadata.
+            #
+            # Instead convert it into REAL values.
+            # ------------------------------------------------
+
+            corrected_slots = (
+                self._extract_correction_slots(
+                    text=text,
+                    current_slots=current_slots,
+                    interruption=interruption,
+                )
+            )
+
+            if corrected_slots:
+
+                print()
+                print("APPLYING CORRECTION:")
+                print(corrected_slots)
+
+                self._merge_slots(
+                    corrected_slots
+                )
+
+                # ------------------------------------------------
+                # Invalidate old task before starting replacement.
+                # ------------------------------------------------
+
+                if (
+                    self.current_execution_task is not None
+                    and not self.current_execution_task.done()
+                ):
+
+                    await self._cancel_current_execution(
+                        invalidate_kernel_task=True
+                    )
+
+                else:
+
+                    # Even if execution already finished, make sure
+                    # an old kernel task cannot be reused.
+                    if (
+                        self.kernel.current_task is not None
+                        and self.kernel.current_task.status
+                        in (
+                            # Keep completed tasks intact for logs,
+                            # but never reuse them for the new search.
+                            self.kernel.current_task.status,
+                        )
+                    ):
+                        pass
+
+                # ------------------------------------------------
+                # If correction leaves all required information,
+                # start exactly ONE new task.
+                # ------------------------------------------------
+
+                if not self._get_missing_slots():
+
+                    await self.start_flight_task()
+
+                else:
+
+                    await self._ask_for_missing_information()
+
+                self.previous_user_text = text
+
+                return
+
+        # ====================================================
+        # NORMAL SLOT UPDATE
+        # ====================================================
+
+        if current_slots:
+
+            self._merge_slots(
+                current_slots
+            )
+
+            # ------------------------------------------------
+            # New slot information means the user is actively
+            # building/changing a flight request.
+            # ------------------------------------------------
+
+            missing = self._get_missing_slots()
+
+            print()
+            print("MISSING SLOTS:")
+            print(missing)
+
+            if not missing:
+
+                # If a search is already running, don't start
+                # another one.
+                if self.flight_search_running:
+
+                    print(
+                        "Flight search already running."
+                    )
+
+                else:
+
+                    await self.start_flight_task()
+
+            else:
+
+                await self._ask_for_missing_information()
+
+        else:
+
+            # =================================================
+            # NO FLIGHT SLOTS IN THIS UTTERANCE
+            # =================================================
+            #
+            # This is the critical fix.
+            #
+            # If the previous flight search completed and the
+            # user now says:
+            #
+            #   "banana fruit"
+            #
+            # or:
+            #
+            #   "give me its details"
+            #
+            # we DO NOT launch the same flight search again.
+            #
+            # Gemini handles the conversation normally.
+            # =================================================
+
+            print()
+            print(
+                "No flight slots detected. "
+                "Controller will not start a new search."
+            )
+
+        # ----------------------------------------------------
+        # Save previous utterance
+        # ----------------------------------------------------
+
+        self.previous_user_text = text
+
+    # ========================================================
+    # RESET
+    # ========================================================
+
+    async def reset(self):
+
+        print()
+        print("RESETTING ECHO FLOW CONTROLLER")
+
+        await self._cancel_current_execution(
+            invalidate_kernel_task=True
+        )
+
+        self.flight_slots.clear()
+
+        self.previous_user_text = ""
+
+        self.flight_search_completed = False
+
+        self.last_response_text = None
+
+        print(
+            "Controller reset complete."
+        )
+
+
+# ============================================================
+# LIVEKIT SERVER
+# ============================================================
+
+server = AgentServer()
+
+
+# ============================================================
+# LIVEKIT ENTRYPOINT
+# ============================================================
+
+@server.rtc_session()
+async def entrypoint(ctx: JobContext):
+
+    print()
+    print("===================================")
+    print("ECHO FLOW LIVEKIT AGENT STARTING")
+    print("===================================")
+
+    # --------------------------------------------------------
+    # Gemini Realtime
+    # --------------------------------------------------------
+
+    realtime_model = google.realtime.RealtimeModel(
+        model="gemini-3.8-live",
+        voice="Puck",
+        instructions=(
+            "You are Echo Flow, a helpful flight assistant. "
+            "Have a natural voice conversation with the user. "
+            "Only treat an utterance as a flight-search request "
+            "when the user clearly provides or asks for flight "
+            "information. "
+            "Do not start a flight search merely because the "
+            "conversation previously contained flight details. "
+            "Do not repeat questions for information already provided. "
+            "If the user is casually chatting, answer naturally. "
+            "If the controller announces a completed flight-search "
+            "result, announce it naturally without changing facts."
+        ),
+    )
+
+    # --------------------------------------------------------
+    # Agent session
+    # --------------------------------------------------------
+
+    session = AgentSession(
+        llm=realtime_model,
+    )
+
+    # --------------------------------------------------------
+    # Controller
+    # --------------------------------------------------------
+
+    controller = EchoFlowController(
+        session
+    )
+
+    # --------------------------------------------------------
+    # User transcript handler
+    # --------------------------------------------------------
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(event):
+
+        try:
+
+            transcript = event.transcript
+
+            is_final = getattr(
+                event,
+                "is_final",
+                False,
+            )
+
+            print()
+            print("TRANSCRIPT EVENT")
+            print("TEXT:", transcript)
+            print("FINAL:", is_final)
+
+            # ------------------------------------------------
+            # Only process final transcripts.
+            # ------------------------------------------------
+
+            if not is_final:
+                return
+
+            if not transcript:
+                return
+
+            # ------------------------------------------------
+            # Controller processing is serialized internally
+            # by handle_lock.
+            # ------------------------------------------------
+
+            asyncio.create_task(
+                controller.handle_user_text(
+                    transcript
+                )
+            )
+
+        except Exception as exc:
+
+            print()
+            print("TRANSCRIPT HANDLER ERROR:")
+            print(
+                type(exc).__name__,
+                exc,
+            )
+
+    # --------------------------------------------------------
+    # Session state logging
+    # --------------------------------------------------------
+
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(event):
+
+        try:
+
+            print()
+            print(
+                "AGENT STATE:",
+                event,
+            )
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # Error logging
+    # --------------------------------------------------------
+
+    @session.on("error")
+    def on_session_error(event):
+
+        print()
+        print("LIVEKIT SESSION ERROR:")
+        print(event)
+
+    # --------------------------------------------------------
+    # Start session
+    # --------------------------------------------------------
+
+    await session.start(
+        room=ctx.room,
+        agent=EchoFlowAgent(),
+    )
+
+    # --------------------------------------------------------
+    # Connect to LiveKit
+    # --------------------------------------------------------
+
+    await ctx.connect()
+
+    print()
+    print("===================================")
+    print("ECHO FLOW CONNECTED")
+    print("===================================")
+    print("Waiting for user speech...")
+
+    # Gemini Realtime handles normal conversation.
+    #
+    # The controller only uses generate_reply() for completed
+    # flight-search announcements.
+
+    await asyncio.Event().wait()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    cli.run_app(server)
